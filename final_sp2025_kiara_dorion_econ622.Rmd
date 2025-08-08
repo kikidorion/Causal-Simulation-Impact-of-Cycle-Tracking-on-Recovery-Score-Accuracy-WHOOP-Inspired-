@@ -1,0 +1,364 @@
+---
+title: "Final"
+author: "Kiara Dorion"
+output: 
+  html_notebook:
+    number_sections: true
+    theme: readable
+    highlight: pygments
+    toc: true
+    toc_float: 
+      collapsed: no
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# Dependencies {.unnumbered}
+
+```{r dependencies}
+library(dplyr) # for data manipulation, but really just for dplyr::bind_rows()
+library(ggplot2) # for plotting your simulation results
+library(grf) # for regression forests
+library(patchwork) # use this to combine ggplots; see the demo in Canvas
+```
+
+# Question 1
+
+```{r q1}
+set.seed(42)
+
+#simulate confounders
+n = 1e3
+HC = rnorm(n,0,1) #this represents health consciousness
+PA = rnorm(n,0,1) #this represents physical activity
+
+#treatment assignment: WHOOP usage depends on HC and PA
+propensity_score = plogis(1.2 * HC + 0.8 * PA)
+Treat = rbinom(n,1,propensity_score)
+
+#simulate sleep quality score (outcome)
+tau_true = 2 #true effect of WHOOP on sleep quality
+noise = rnorm(n,0,1)
+Y = 70 + tau_true * Treat + 1.5 * HC + 1.0 * PA + noise
+
+df = data.frame(HC,PA,Treat,Y)
+
+#Run causal forest to adjust for confounders
+X =  df[, c("HC", "PA")]
+W = df$Treat
+Y_obs = df$Y
+
+cf = causal_forest(X,Y_obs,W)
+tau = average_treatment_effect(cf,target.sample = "control") #controlling for lack of overlap
+
+#print(paste("Estimated ATE:", round(tau,2)))
+#checking spread of propensity scores check if theres good overlop
+#(propensity_score, breaks = 30, main = "Distribution of Propensity Scores", xlab = "P(T = 1 | HC, PA)")
+```
+
+Interpretation: Simulated observational study to estimate the causal
+effect of WHOOP device usage on sleep quality, accounting for
+confounding variables.
+
+Variables: Treatment (Treat): WHOOP device usage (1 = user, 0 =
+non-user) Outcome (Y): Sleep quality score (e.g., based on duration,
+efficiency, and disturbances) Confounders: Health Consciousness (HC):
+Individuals who are more aware of health may be more likely to use WHOOP
+and have better sleep. Physical Activity Level (PA): More active
+Individuals may be more inclined to use WHOOP and also experience better
+sleep.
+
+# Question 2.1
+
+```{r q2.1}
+simulate_experiment = function(n=1e5, tau=3, linear=TRUE) {
+  #Convert n to integer if it's passed as 1e5
+  n = as.integer(n)
+  
+  #Simulate X1,X2,X3 ~ N(0,1)
+  X1 = rnorm(n)
+  X2 = rnorm(n)
+  X3 = rnorm(n)
+  
+  #simulate epsilon
+  epsilon = rnorm(n)
+  
+  #Treatment assignment probability P(W=1|X)
+   if (linear) {
+    ps = 1 / (1 + exp(-X3))  #Log function of X3
+  } else {
+    ps = 1 / (1 + exp(- (1 + sin(X1) + cos(X2)^2)))  #More complex
+  }
+  
+  #simulate treatment W ~ Bernoulli(ps)
+  W = rbinom(n,1,ps)
+  
+ # Generate outcome Y
+  if (linear) {
+    Y = tau * W + X1 + X2 + X3 + epsilon
+  } else {
+    Y = tau * W + X1^3 + 3 * sin(X2) + pmax(X3, 0) + X1 * X2 + epsilon
+  }
+  
+  # Return as data.frame
+  return(data.frame(
+    Y = Y,
+    X1 = X1,
+    X2 = X2,
+    X3 = X3,
+    W = W,
+    tau = tau,
+    linear = linear
+  ))
+}
+#simulate_experiment()
+```
+
+# Question 2.2
+
+```{r q2.2}
+# Simulate data
+sample_data = simulate_experiment(n = 10000, tau = 3, linear = TRUE)
+
+simulate_ate = function(sample_data, method = "ols") {
+  Y = sample_data$Y
+  W = sample_data$W
+  X = as.matrix(sample_data[, c("X1", "X2", "X3")])
+  
+  if (method == "ols") {
+    model_ols = lm(Y ~ W + X1 + X2 + X3, data = sample_data)
+    return(coef(model_ols)["W"])
+  }
+  
+  if (method == "aipw_manual") {
+    propensity_model = glm(W ~ X1 + X2 + X3, data = sample_data, family = binomial)
+    e_hat = predict(propensity_model, type = "response")
+    
+    mu1_model = lm(Y ~ X1 + X2 + X3, data = sample_data, subset = W == 1)
+    mu0_model = lm(Y ~ X1 + X2 + X3, data = sample_data, subset = W == 0)
+    
+    mu1_hat = predict(mu1_model, newdata = sample_data)
+    mu0_hat = predict(mu0_model, newdata = sample_data)
+    
+    D = mu1_hat - mu0_hat
+    R = (W * (Y - mu1_hat) / e_hat) - ((1 - W) * (Y - mu0_hat) / (1 - e_hat))
+    
+    tau_hat = mean(D + R)
+    return(tau_hat)
+  }
+  
+  if (method == "causal_forest") {
+    cf_model = causal_forest(X, Y, W)
+    tau_hat = average_treatment_effect(cf_model, target.sample = "control")
+    return(as.numeric(tau_hat[["estimate"]]))  # safely extract scalar
+  }
+  
+  stop("Method must be one of: 'ols', 'aipw_manual', or 'causal_forest'")
+}
+
+#print(paste("OLS Simulated ATE:", simulate_ate(sample_data, method = "ols")))
+#print(paste("AIPW Manual Simulated ATE:", simulate_ate(sample_data, method = "aipw_manual")))
+#print(paste("Causal Forest Simulated ATE (Estimate/Error):", simulate_ate(sample_data, method = "causal_forest")))
+```
+
+# Question 2.3
+
+```{r q2.3}
+master_data = simulate_experiment(n = 1e5, tau = 3, linear = TRUE)
+
+monte_carlo_ate = function(data,
+                            sample_size = c(100, 500, 1000, 2000),
+                            n_sims = 1e2,
+                            method = "ols") {
+  # Ensure n_sims is an integer
+  n_sims = as.integer(n_sims)
+  
+  # Create a list to store results from each sample size
+  results_list = list()
+  
+  # Loop over each sample size
+  for (s in sample_size) {
+    tau_hats = numeric(n_sims)
+    
+    for (i in 1:n_sims) {
+      # Sample with replacement from the full data
+      sample_data = data[sample(1:nrow(data), size = s, replace = TRUE), ]
+      
+      # Estimate tau
+      tau_hat = simulate_ate(sample_data, method = method)
+      tau_hats[i] = tau_hat
+    }
+    
+    # Store results as a data.frame
+    df = data.frame(
+      sample_size = rep(s, n_sims),
+      tau_hat = tau_hats,
+      tau = data$tau[1],
+      linear = data$linear[1],
+      method = ifelse(method == "ols", "ols", "machine_learning")
+    )
+    
+    # Append to list
+    results_list[[as.character(s)]] = df
+  }
+  
+  # Combine into a single data.frame
+  final_results = dplyr::bind_rows(results_list)
+  return(final_results)
+}
+
+#Run monte carlo experiment and show results
+#results_df = monte_carlo_ate(data = master_data, method = "ols", n_sims = 100)
+#head(results_df)
+```
+
+# Question 2.4
+
+```{r q2.4}
+#Simulate linear and nonlinear data
+df_linear = simulate_experiment(n = 1e5, tau = 3, linear = TRUE)
+df_nonlinear = simulate_experiment(n = 1e5, tau = 3, linear = FALSE)
+```
+
+# Question 2.5
+
+```{r q2.5}
+#Run Monte Carlo simulation using OLS on both datasets
+results_linear = monte_carlo_ate(data = df_linear, method = "ols")
+results_nonlinear = monte_carlo_ate(data = df_nonlinear, method = "ols")
+
+#Add a label to each for plotting
+results_linear$label = "linear"
+results_nonlinear$label = "nonlinear"
+
+#Combine results
+results_combined = dplyr::bind_rows(results_linear, results_nonlinear)
+
+#boxplot
+ggplot(results_combined, aes(x = factor(sample_size), y = tau_hat, fill = label)) +
+  geom_boxplot(outlier.size = 0.5) +
+  geom_hline(yintercept = 3, linetype = "dashed", color = "black") +
+  labs(
+    title = "Monte Carlo Estimates of Tau using OLS",
+    subtitle = "Comparing Linear vs Nonlinear DGPs",
+    x = "Sample Size",
+    y = "Estimated τ (tau_hat)",
+    fill = "Data Generating Process"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+# Question 2.6
+
+```{r q2.6}
+#Run Monte Carlo simulation using manual AIPW
+results_linear = monte_carlo_ate(data = df_linear, method = "aipw_manual")
+results_nonlinear = monte_carlo_ate(data = df_nonlinear, method = "aipw_manual")
+
+#Label each set
+results_linear$label = "linear"
+results_nonlinear$label = "nonlinear"
+
+#Combine results
+results_combined = dplyr::bind_rows(results_linear, results_nonlinear)
+
+#boxplot
+ggplot(results_combined, aes(x = factor(sample_size), y = tau_hat, fill = label)) +
+  geom_boxplot(outlier.size = 0.5) +
+  geom_hline(yintercept = 3, linetype = "dashed", color = "black") +
+  labs(
+    title = "Monte Carlo Estimates of Tau using Manual AIPW",
+    subtitle = "Comparing Linear vs Nonlinear DGPs",
+    x = "Sample Size",
+    y = "Estimated tau_hat",
+    fill = "Data Generating Process"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+# Question 2.7
+
+```{r q2.7}
+#Run Monte Carlo with causal forest
+results_linear = monte_carlo_ate(data = df_linear, method = "causal_forest")
+results_nonlinear = monte_carlo_ate(data = df_nonlinear, method = "causal_forest")
+
+#Label each result set
+results_linear$label = "linear"
+results_nonlinear$label = "nonlinear"
+
+#Combine both
+results_combined = dplyr::bind_rows(results_linear, results_nonlinear)
+
+#boxplot of monte carlo estimates using causal forest
+ggplot(results_combined, aes(x = factor(sample_size), y = tau_hat, fill = label)) +
+  geom_boxplot(outlier.size = 0.5) +
+  geom_hline(yintercept = 3, linetype = "dashed", color = "black") +
+  labs(
+    title = "Monte Carlo Estimates of Tau using Causal Forest",
+    subtitle = "Comparing Linear vs Nonlinear DGPs",
+    x = "Sample Size",
+    y = "Estimated tau_hat",
+    fill = "Data Generating Process"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+# Question 2.8
+
+```{r q2.8}
+## Method Comparison – Parametric vs. Non-Parametric Estimators
+# This simulation demonstrates how estimator performance depends on both data structure and modeling assumptions. Choosing the right method means balancing interpretability, robustness, and real-world complexity.
+```
+
+## Method Comparison – Parametric vs. Non-Parametric Estimators
+
+### Key Takeaways from the Simulation
+
+Goal: This simulation helped us explore how different types of models
+estimate the true impact of a treatment. We focused on whether each
+method could consistently get close to the actual average treatment
+effect (ATE), especially when the data relationships were either simple
+(linear) or more complex (nonlinear).
+
+### Strengths of Parametric Methods (OLS, AIPW)
+
+-   OLS (Ordinary Least Squares) is fast and easy to use. It works well
+    when the relationship between variables is truly linear.
+-   AIPW (Augmented Inverse Probability Weighting) is more flexible. It
+    still gives reliable results even if only one part of the model (the
+    outcome or the treatment prediction) is correct.
+
+### Weaknesses of Parametric Methods
+
+-   OLS can give the wrong answer if the relationship in the data is
+    nonlinear or includes complex interactions.
+-   AIPW still assumes that one of the two models (either for treatment
+    or outcome) is specified correctly — which may not always be true.
+
+### Strengths of Non-Parametric Method (Causal Forest)
+
+-   Causal Forest doesn’t assume a specific shape or structure for the
+    data — it learns directly from patterns in the data.
+-   It’s great at picking up complex trends and interactions between
+    variables.
+-   It still produces consistent estimates of treatment effects, even
+    when simpler models like OLS fail.
+
+### Weaknesses of Non-Parametric Method
+
+-   It needs more data to perform well. With small samples, it can be
+    unstable or noisy.
+-   It’s harder to explain or interpret compared to something like OLS.
+-   It also takes longer to run, especially in simulations.
+
+### Final Takeaway
+
+-   Use OLS when we're confident the relationships in your data are
+    simple and linear.
+-   Use AIPW when we want some protection in case your model isn’t
+    perfect.
+-   Use Causal Forest when you expect more complicated patterns or we're
+    working with messy, real-world data — as long as we have enough
+    observations.
